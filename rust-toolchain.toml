@@ -1,0 +1,4 @@
+[toolchain]
+channel = "esp"
+components = ["rustc", "cargo", "rust-std", "rust-src", "llvm-tools"]
+targets = ["xtensa-esp32-espidf"]
