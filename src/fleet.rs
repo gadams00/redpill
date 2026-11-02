@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 pub const POST_INTERVAL: Duration = Duration::from_secs(15 * 60);
 /// A reading older than this is stale and is not posted.
 pub const MAX_READING_AGE: Duration = Duration::from_secs(20 * 60);
+/// After a failed post, wait this long before offering that Pill again. Without it a failing
+/// network (e.g. Wi-Fi up but no internet) would be retried every main-loop tick.
+pub const POST_RETRY_DELAY: Duration = Duration::from_secs(30);
 
 struct PillState {
     addr: Addr,
@@ -21,6 +24,15 @@ struct PillState {
     last_post: Option<Instant>,
     /// Whether this Pill has been heard since boot.
     seen: bool,
+    /// Do not offer this Pill again before this time (set after a failed post).
+    retry_after: Option<Instant>,
+}
+
+/// Whether an HTTP response to a Brewfather post counts as success. Only 2xx does: a router's
+/// "device paused" page, a captive portal or a rate-limit/error from Brewfather must not be
+/// mistaken for a delivered reading (the reading would be dropped and not retried for 15 minutes).
+pub fn is_success_status(status: u16) -> bool {
+    (200..300).contains(&status)
 }
 
 /// What `Fleet::on_heard` made of an advertisement, so the caller can log it.
@@ -92,7 +104,7 @@ impl Fleet {
         Fleet {
             pills: configured
                 .into_iter()
-                .map(|(addr, name)| PillState { addr, name, latest: None, last_post: None, seen: false })
+                .map(|(addr, name)| PillState { addr, name, latest: None, last_post: None, seen: false, retry_after: None })
                 .collect(),
             reported_unlisted: Vec::new(),
         }
@@ -150,7 +162,8 @@ impl Fleet {
                 let interval_elapsed =
                     p.last_post.map_or(true, |t| now.saturating_duration_since(t) >= POST_INTERVAL);
                 let fresh = now.saturating_duration_since(heard_at) <= MAX_READING_AGE;
-                (interval_elapsed && fresh).then(|| Post { idx, name: p.name.clone(), reading })
+                let backed_off = p.retry_after.is_some_and(|t| now < t);
+                (interval_elapsed && fresh && !backed_off).then(|| Post { idx, name: p.name.clone(), reading })
             })
             .collect()
     }
@@ -159,6 +172,13 @@ impl Fleet {
         let p = &mut self.pills[idx];
         p.last_post = Some(now);
         p.latest = None;
+        p.retry_after = None;
+    }
+
+    /// Record that posting this Pill failed: it is not offered again for `POST_RETRY_DELAY`.
+    /// Its reading is kept (until it goes stale) and other Pills are unaffected.
+    pub fn mark_failed(&mut self, idx: usize, now: Instant) {
+        self.pills[idx].retry_after = Some(now + POST_RETRY_DELAY);
     }
 }
 
@@ -180,6 +200,18 @@ mod tests {
 
     fn mins(n: u64) -> Duration {
         Duration::from_secs(n * 60)
+    }
+
+    #[test]
+    fn only_2xx_responses_count_as_a_delivered_post() {
+        for ok in [200, 201, 204, 299] {
+            assert!(is_success_status(ok), "{ok} should be success");
+        }
+        // 405 is what a router's "paused device" page answered with; the rest are typical
+        // redirects (captive portals), client errors, rate limits and server errors.
+        for bad in [0, 100, 199, 300, 302, 400, 401, 403, 404, 405, 429, 500, 502, 503] {
+            assert!(!is_success_status(bad), "{bad} must not be success");
+        }
     }
 
     #[test]
@@ -270,6 +302,81 @@ mod tests {
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].name, "Yellow Pill 1");
         assert_eq!(due[0].reading.gravity, 1.050);
+    }
+
+    #[test]
+    fn a_failed_post_is_not_retried_until_the_delay_has_passed() {
+        let t0 = Instant::now();
+        let mut fleet = two_pills();
+        fleet.on_heard(A, reading(1.050), t0);
+        assert_eq!(fleet.due(t0).len(), 1);
+        fleet.mark_failed(0, t0);
+
+        // Every one-second tick inside the delay is quiet...
+        for secs in [0, 1, 2, 15, 29] {
+            let t = t0 + Duration::from_secs(secs);
+            fleet.on_heard(A, reading(1.049), t); // a fresh reading must not bypass the backoff
+            assert!(fleet.due(t).is_empty(), "offered again after only {secs}s");
+        }
+        // ...and it is offered again, with the newest reading, once the delay is over.
+        let t30 = t0 + POST_RETRY_DELAY;
+        fleet.on_heard(A, reading(1.048), t30);
+        let due = fleet.due(t30);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].reading.gravity, 1.048);
+    }
+
+    #[test]
+    fn repeated_failures_keep_backing_off_without_giving_up() {
+        let t0 = Instant::now();
+        let mut fleet = two_pills();
+        fleet.on_heard(A, reading(1.050), t0);
+        let mut now = t0;
+        for _ in 0..5 {
+            assert_eq!(fleet.due(now).len(), 1);
+            fleet.mark_failed(0, now);
+            assert!(fleet.due(now + Duration::from_secs(1)).is_empty());
+            now += POST_RETRY_DELAY;
+            fleet.on_heard(A, reading(1.050), now); // keep the reading fresh
+        }
+    }
+
+    #[test]
+    fn one_pills_backoff_does_not_delay_another() {
+        let t0 = Instant::now();
+        let mut fleet = two_pills();
+        fleet.on_heard(A, reading(1.050), t0);
+        fleet.on_heard(B, reading(1.012), t0);
+        fleet.mark_failed(0, t0); // A fails
+        let due = fleet.due(t0 + Duration::from_secs(1));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].name, "Red Pill 2");
+    }
+
+    #[test]
+    fn backoff_does_not_keep_a_stale_reading_alive() {
+        let t0 = Instant::now();
+        let mut fleet = two_pills();
+        fleet.on_heard(A, reading(1.050), t0);
+        fleet.mark_failed(0, t0);
+        let late = t0 + mins(21);
+        assert_eq!(fleet.drop_stale(late), vec!["Yellow Pill 1".to_string()]);
+        assert!(fleet.due(late).is_empty());
+    }
+
+    #[test]
+    fn a_successful_post_after_failures_resets_the_normal_cycle() {
+        let t0 = Instant::now();
+        let mut fleet = two_pills();
+        fleet.on_heard(A, reading(1.050), t0);
+        fleet.mark_failed(0, t0);
+        let t31 = t0 + Duration::from_secs(31);
+        fleet.mark_posted(0, t31);
+        // Next post is 15 minutes after the success, not affected by the earlier failure.
+        fleet.on_heard(A, reading(1.049), t31 + mins(14));
+        assert!(fleet.due(t31 + mins(14)).is_empty());
+        fleet.on_heard(A, reading(1.048), t31 + mins(15));
+        assert_eq!(fleet.due(t31 + mins(15)).len(), 1);
     }
 
     #[test]

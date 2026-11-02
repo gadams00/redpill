@@ -204,10 +204,13 @@ plain text. Don't share a built binary, and wipe the board before giving it away
 
 ## Status
 
-- Verified on hardware: Wi-Fi, continuous BLE scanning, decoding a **v2** Pill (temperature, gravity
-  and battery matched the RAPT app, including SG 1.002 with the Pill floating in liquid), and posting
-  to Brewfather under the configured device name. Wi-Fi (re)connect works at startup.
-- Not verified: **more than one Pill**, v1-format Pills, release builds, and **Wi-Fi recovery after an
-  outage while running**.
+- Verified on hardware: Wi-Fi, continuous BLE scanning on its own thread, decoding a **v2** Pill
+  (temperature, gravity and battery matched the RAPT app, including SG 1.002 with the Pill floating
+  in liquid), and posting to Brewfather under the configured device name. Also verified with the
+  internet blocked while Wi-Fi stayed up (the router answered with its own page, HTTP 405): the board
+  kept the reading, retried every 30 seconds, and posted as soon as the internet came back, without
+  a reboot.
+- Not verified: **more than one Pill**, v1-format Pills, release builds, and **recovery when the
+  Wi-Fi connection itself drops while running** (the router tests only blocked internet access).
 
 For how the code is organised, and how to run the host-side unit tests (`./scripts/host-test.sh`), see `CLAUDE.md`.

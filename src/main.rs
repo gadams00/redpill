@@ -211,7 +211,7 @@ fn main() -> Result<()> {
         if up {
             for post in fleet.due(now) {
                 match send_to_brewfather(&post.name, post.reading.temp_c, post.reading.gravity) {
-                    Ok(_) => {
+                    Ok(status) if fleet::is_success_status(status) => {
                         info!(
                             "Successfully pushed {:?} to Brewfather: {:.2} C, SG {:.4}, battery {}%",
                             post.name, post.reading.temp_c, post.reading.gravity, post.reading.battery_pct
@@ -219,8 +219,21 @@ fn main() -> Result<()> {
                         fleet.mark_posted(post.idx, Instant::now());
                         post_failures = 0;
                     }
+                    Ok(status) => {
+                        // We reached something, but it was not Brewfather accepting the reading
+                        // (a router's block page, a captive portal, a rate limit, an error).
+                        // Keep the reading and retry after the backoff. The network itself works,
+                        // so this does not count towards resetting Wi-Fi.
+                        error!(
+                            "Brewfather did not accept {:?}: HTTP status {status}; will retry",
+                            post.name
+                        );
+                        fleet.mark_failed(post.idx, Instant::now());
+                        post_failures = 0;
+                    }
                     Err(e) => {
                         error!("Failed to push {:?} to Brewfather: {e}", post.name);
+                        fleet.mark_failed(post.idx, Instant::now());
                         post_failures += 1;
                         if post_failures >= FAILURES_BEFORE_RECONNECT {
                             warn!("{post_failures} posts failed in a row; resetting the Wi-Fi connection");
@@ -299,7 +312,9 @@ fn scan_forever(shared: Arc<Shared>, ready: mpsc::Sender<()>) {
     }
 }
 
-fn send_to_brewfather(name: &str, temp: f32, gravity: f32) -> Result<()> {
+/// Post one reading. Returns the HTTP status of the response; an `Err` means the request never
+/// completed (DNS, connection, timeout). The caller decides what counts as success.
+fn send_to_brewfather(name: &str, temp: f32, gravity: f32) -> Result<u16> {
     let payload = BrewfatherPayload {
         name: name.to_string(),
         temp,
@@ -327,9 +342,5 @@ fn send_to_brewfather(name: &str, temp: f32, gravity: f32) -> Result<()> {
     let status = response.status();
     info!("Brewfather API response status: {status}");
 
-    if status != 200 {
-        warn!("Non-200 response received from Brewfather Custom Stream endpoint");
-    }
-
-    Ok(())
+    Ok(status)
 }
