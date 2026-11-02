@@ -16,7 +16,9 @@ RAPT Pill ──BLE──▶ ESP32 ──Wi-Fi──▶ Brewfather (Custom Strea
 
 ## What you need
 
-- A **Pill**.
+- A **Pill** set to broadcast over **Bluetooth** (the mode used with a RAPT temperature controller),
+  not Wi-Fi-only. In that mode it sends one short burst on its configured interval (15 minutes in our
+  testing), so after the first reading the board posts about every 15 minutes.
 - An **original ESP32** board (the Xtensa dual-core chip, e.g. ESP32-DevKitC / ESP-WROOM-32) with
   4 MB flash and a USB port. Developed and tested on a board with a CP210x USB-serial chip.
   Other chips (ESP32-S3, -C3, ...) are **not** supported as-is.
@@ -150,20 +152,25 @@ Opening the monitor resets the board. A healthy start looks like:
 
 ```
 Starting ESP32 RAPT Pill to Brewfather Bridge
-Wi-Fi connected successfully! IP address: 192.168.x.x
 Configured Pill FC:E8:C0:5D:74:76 -> Brewfather device "Yellow Pill 1"
 Scanning continuously for RAPT Pill BLE advertisements...
+Wi-Fi connected successfully! IP address: 192.168.x.x
 RAPT Pill "Yellow Pill 1" [FC:E8:C0:5D:74:76] rssi -55: 24.56 C, SG 1.2771, battery 82%
-Successfully pushed "Yellow Pill 1" to Brewfather
+Brewfather API response status: 200
+Successfully pushed "Yellow Pill 1" to Brewfather: 24.56 C, SG 1.2771, battery 82%
 ```
+
+Every 5 minutes a heartbeat line shows the board is alive and what it hears:
+`Still scanning: 8393 Bluetooth advertisements in the last 5 min; RAPT Pill: 4 readings, 2 other packets`.
+("Other packets" are RAPT-format packets the board can't use, such as the Pill's second packet type.)
 
 After that, each Pill is posted at most once per 15 minutes. A reading that has gone 20 minutes
 without an update is dropped rather than posted stale.
 
 ## How it behaves
 
-- **Pill must be awake.** A sleeping Pill sends nothing; once awake, ours was heard every 30 seconds or less. Double-tap it to wake it
-  when testing. In normal use the board just keeps listening.
+- **The Pill only broadcasts on its own schedule.** Between bursts the board hears nothing from it, so a quiet log is normal; the periodic `Still scanning` line shows it is listening. Double-tapping the Pill makes it transmit for a while, which is handy for testing. Since the board remembers the latest reading, a burst that arrives just before the 15-minute post interval is posted a few seconds later, not lost.
+- **RAPT Brew won't log by itself in Bluetooth-only mode.** That is expected: the Pill has no Wi-Fi/cloud path in that mode. This bridge is what carries its readings to Brewfather.
 - **Keep the board in range.** Roughly a few metres. Liquid and the fermenter walls weaken the
   signal; put the board close to the fermenter.
 - **Gravity is only meaningful with the Pill floating in liquid.** On a desk the Pill reports a
@@ -171,7 +178,7 @@ without an update is dropped rather than posted stale.
   (e.g. 86.4); anything outside 0.9-1.3 SG is discarded.
 - **No Pill heard** means nothing is posted. There is no "keep last value" resend.
 - **Wi-Fi/Brewfather failures** are logged (`Failed to push ... to Brewfather`) and retried after the next scan window.
-- **Wi-Fi drops are recovered automatically.** If the router goes away, the board keeps scanning and reconnects when a post is due; if it powers on before the router, it keeps retrying until the network is up. After three failed posts in a row it also resets its Wi-Fi connection. (Written but not yet tested against a real outage.)
+- **Scanning never depends on Wi-Fi.** Bluetooth scanning runs on its own thread, so a slow or failed post, a Wi-Fi outage, or a router that boots slower than the board can't make it miss a Pill. The board checks Wi-Fi every second and reconnects every 10 seconds while it is down; after three failed posts in a row it also resets its Wi-Fi connection. (Written but not yet tested against a real outage.)
 
 ## Troubleshooting
 

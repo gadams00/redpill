@@ -44,6 +44,44 @@ pub struct Post {
     pub reading: Reading,
 }
 
+/// One decoded advertisement from a RAPT Pill.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Sighting {
+    pub addr: Addr,
+    pub rssi: i8,
+    pub reading: Reading,
+}
+
+/// Hand-off between the Bluetooth scan thread (producer) and the main thread (consumer).
+///
+/// The scan callback runs on a tiny task, so it only pushes here and returns. Only the newest
+/// sighting per address is kept, which is all `Fleet` wants, so a burst of packets can't grow
+/// the queue, and the number of distinct addresses is capped so a flood of spoofed Pills can't
+/// either.
+#[derive(Default)]
+pub struct SightingQueue {
+    items: Vec<Sighting>,
+}
+
+impl SightingQueue {
+    /// Most distinct Pill addresses held at once; sightings from further addresses are dropped
+    /// until the queue is drained.
+    pub const MAX_PILLS: usize = 16;
+
+    pub fn push(&mut self, s: Sighting) {
+        match self.items.iter().position(|i| i.addr == s.addr) {
+            Some(i) => self.items[i] = s,
+            None if self.items.len() < Self::MAX_PILLS => self.items.push(s),
+            None => {}
+        }
+    }
+
+    /// Take everything queued so far, leaving the queue empty.
+    pub fn take(&mut self) -> Vec<Sighting> {
+        std::mem::take(&mut self.items)
+    }
+}
+
 pub struct Fleet {
     pills: Vec<PillState>,
     reported_unlisted: Vec<Addr>,
@@ -330,6 +368,73 @@ mod tests {
         assert_eq!(fleet.on_heard(B, reading(1.010), t0), Heard::UnlistedNew);
         assert!(fleet.due(t0 + mins(60)).is_empty());
         assert_eq!(fleet.configured().count(), 0);
+    }
+
+    fn sighting(addr: Addr, sg: f32, rssi: i8) -> Sighting {
+        Sighting { addr, rssi, reading: reading(sg) }
+    }
+
+    #[test]
+    fn queue_starts_empty_and_take_empties_it() {
+        let mut q = SightingQueue::default();
+        assert!(q.take().is_empty());
+        q.push(sighting(A, 1.050, -60));
+        assert_eq!(q.take().len(), 1);
+        assert!(q.take().is_empty());
+    }
+
+    #[test]
+    fn queue_keeps_only_the_newest_sighting_per_address() {
+        let mut q = SightingQueue::default();
+        q.push(sighting(A, 1.050, -60));
+        q.push(sighting(A, 1.049, -55));
+        q.push(sighting(A, 1.048, -70));
+        let got = q.take();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].reading.gravity, 1.048);
+        assert_eq!(got[0].rssi, -70);
+    }
+
+    #[test]
+    fn queue_holds_separate_pills_in_arrival_order() {
+        let mut q = SightingQueue::default();
+        q.push(sighting(A, 1.050, -60));
+        q.push(sighting(B, 1.010, -65));
+        q.push(sighting(A, 1.049, -61)); // update must not reorder or duplicate
+        let got = q.take();
+        assert_eq!(got.iter().map(|s| s.addr).collect::<Vec<_>>(), vec![A, B]);
+        assert_eq!(got[0].reading.gravity, 1.049);
+    }
+
+    #[test]
+    fn queue_is_capped_but_still_updates_known_pills_when_full() {
+        let mut q = SightingQueue::default();
+        for i in 0..(SightingQueue::MAX_PILLS as u8 + 10) {
+            q.push(sighting([0, 0, 0, 0, 0, i], 1.000, -50));
+        }
+        // An address already queued can still be refreshed after the cap is reached...
+        q.push(sighting([0, 0, 0, 0, 0, 0], 1.099, -40));
+        let got = q.take();
+        assert_eq!(got.len(), SightingQueue::MAX_PILLS);
+        assert_eq!(got[0].reading.gravity, 1.099);
+        // ...and the queue accepts new addresses again once drained.
+        q.push(sighting([9, 9, 9, 9, 9, 9], 1.000, -50));
+        assert_eq!(q.take().len(), 1);
+    }
+
+    #[test]
+    fn queued_sightings_feed_the_fleet() {
+        let t0 = Instant::now();
+        let mut fleet = two_pills();
+        let mut q = SightingQueue::default();
+        q.push(sighting(A, 1.050, -60));
+        q.push(sighting(STRANGER, 1.030, -80));
+        for s in q.take() {
+            fleet.on_heard(s.addr, s.reading, t0);
+        }
+        let due = fleet.due(t0);
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].name, "Yellow Pill 1");
     }
 
     #[test]
