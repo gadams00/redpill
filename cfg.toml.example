@@ -1,12 +1,15 @@
-# Copy to cfg.toml (which is gitignored) and fill in. Read at build time by toml-cfg;
-# the values are compiled into the firmware.
+# OPTIONAL. Copy to cfg.toml (which is gitignored) only if you want defaults compiled in.
+# Normally leave this out: the board's setup portal and settings page configure everything.
+#
+# These values only seed an EMPTY board (copied into its flash on first boot). Once settings are
+# saved on the board they win; to start over, `espflash erase-flash` and flash again.
 [redpill]
 wifi_ssid = "your-network-name"
 wifi_pass = "your-wifi-password"
 # The id= value from your Brewfather Custom Stream URL (http://log.brewfather.net/stream?id=<this>)
 brewfather_stream_id = "your-stream-id"
 # One entry per Pill, separated by semicolons: ADDRESS=Name. The name is the Brewfather device
-# name, so it must be unique. Pills not listed here are ignored (their address is logged once).
-# Don't know your Pill's address yet? Set `pills = ""`, flash, double-tap the Pill, and copy the
-# address from the "Found RAPT Pill ..." log line. Nothing is posted while the list is empty.
+# name, so it must be unique. Leave empty to name Pills later on the settings page.
 pills = "AA:BB:CC:DD:EE:FF=Fermenter 1;11:22:33:44:55:66=Fermenter 2"
+# Password of the setup Wi-Fi network the board opens for first-time setup (8-63 characters).
+setup_pass = "redpill1"

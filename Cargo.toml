@@ -16,3 +16,8 @@ toml-cfg = "0.2.0"
 
 [build-dependencies]
 embuild = { version = "0.33", features = ["espidf"] }
+
+# ESP-IDF 5 moved mDNS out of the core into a managed component. It gives the board its
+# redpill.local name; esp-idf-svc's `mdns` module is only compiled when this is present.
+[[package.metadata.esp-idf-sys.extra_components]]
+remote_component = { name = "espressif/mdns", version = "1.8.2" }

@@ -22,10 +22,18 @@ struct PillState {
     /// Newest valid reading and when it was heard; cleared once posted.
     latest: Option<(Reading, Instant)>,
     last_post: Option<Instant>,
+    /// Newest reading heard, kept after posting so the settings page can show it.
+    last_heard: Option<(Reading, i8, Instant)>,
     /// Whether this Pill has been heard since boot.
     seen: bool,
     /// Do not offer this Pill again before this time (set after a failed post).
     retry_after: Option<Instant>,
+}
+
+impl PillState {
+    fn new(addr: Addr, name: String) -> Self {
+        PillState { addr, name, latest: None, last_heard: None, last_post: None, seen: false, retry_after: None }
+    }
 }
 
 /// Whether an HTTP response to a Brewfather post counts as success. Only 2xx does: a router's
@@ -94,9 +102,33 @@ impl SightingQueue {
     }
 }
 
+/// A Pill that is heard but not configured: shown on the settings page so the user can name it.
+/// Its reading is never posted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct UnlistedPill {
+    pub addr: Addr,
+    pub rssi: i8,
+    pub reading: Reading,
+    pub age: Duration,
+}
+
+/// A configured Pill as shown on the settings page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PillStatus {
+    pub addr: Addr,
+    pub name: String,
+    /// Newest reading, its signal strength and how long ago it was heard; `None` if never heard
+    /// since boot.
+    pub last: Option<(Reading, i8, Duration)>,
+}
+
+/// Most distinct unlisted Pills remembered at once (same bound as `SightingQueue`), so a flood of
+/// spoofed advertisements can't grow memory.
+const MAX_UNLISTED: usize = SightingQueue::MAX_PILLS;
+
 pub struct Fleet {
     pills: Vec<PillState>,
-    reported_unlisted: Vec<Addr>,
+    unlisted: Vec<(Addr, i8, Reading, Instant)>,
 }
 
 impl Fleet {
@@ -104,10 +136,88 @@ impl Fleet {
         Fleet {
             pills: configured
                 .into_iter()
-                .map(|(addr, name)| PillState { addr, name, latest: None, last_post: None, seen: false, retry_after: None })
+                .map(|(addr, name)| PillState::new(addr, name))
                 .collect(),
-            reported_unlisted: Vec::new(),
+            unlisted: Vec::new(),
         }
+    }
+
+    /// Replace the configured list (the user edited it on the settings page).
+    ///
+    /// * A Pill that stays listed with the same name keeps its reading and timers.
+    /// * A renamed Pill keeps its reading but is due immediately: Brewfather sees a new device
+    ///   with its own 15-minute limit.
+    /// * A Pill that was only heard as unlisted becomes configured with that reading, so it is
+    ///   posted on the next pass instead of waiting for another advertisement.
+    /// * Removed Pills are forgotten.
+    pub fn set_configured(&mut self, configured: Vec<(Addr, String)>) {
+        let mut old = std::mem::take(&mut self.pills);
+        for (addr, name) in configured {
+            if let Some(i) = old.iter().position(|p| p.addr == addr) {
+                let mut p = old.swap_remove(i);
+                if p.name != name {
+                    p.name = name;
+                    p.last_post = None;
+                    p.retry_after = None;
+                }
+                self.pills.push(p);
+            } else {
+                let mut p = PillState::new(addr, name);
+                if let Some(i) = self.unlisted.iter().position(|u| u.0 == addr) {
+                    let (_, rssi, reading, heard_at) = self.unlisted.remove(i);
+                    p.latest = Some((reading, heard_at));
+                    p.last_heard = Some((reading, rssi, heard_at));
+                    p.seen = true;
+                }
+                self.pills.push(p);
+            }
+        }
+        // A removed Pill goes back to being "heard but unlisted" if its reading is still fresh.
+        for p in old {
+            if let Some((reading, rssi, heard_at)) = p.last_heard {
+                self.remember_unlisted(p.addr, rssi, reading, heard_at);
+            }
+        }
+    }
+
+    /// Configured Pills with their newest readings, for the settings page.
+    pub fn status(&self, now: Instant) -> Vec<PillStatus> {
+        self.pills
+            .iter()
+            .map(|p| PillStatus {
+                addr: p.addr,
+                name: p.name.clone(),
+                last: p.last_heard.map(|(r, rssi, t)| (r, rssi, now.saturating_duration_since(t))),
+            })
+            .collect()
+    }
+
+    /// Pills heard recently that are not configured, newest first.
+    pub fn unlisted(&self, now: Instant) -> Vec<UnlistedPill> {
+        let mut out: Vec<UnlistedPill> = self
+            .unlisted
+            .iter()
+            .map(|&(addr, rssi, reading, t)| UnlistedPill {
+                addr,
+                rssi,
+                reading,
+                age: now.saturating_duration_since(t),
+            })
+            .collect();
+        out.sort_by_key(|u| u.age);
+        out
+    }
+
+    fn remember_unlisted(&mut self, addr: Addr, rssi: i8, reading: Reading, now: Instant) -> bool {
+        if let Some(u) = self.unlisted.iter_mut().find(|u| u.0 == addr) {
+            *u = (addr, rssi, reading, now);
+            return false;
+        }
+        if self.unlisted.len() < MAX_UNLISTED {
+            self.unlisted.push((addr, rssi, reading, now));
+            return true;
+        }
+        false
     }
 
     /// `(address, name)` of each configured Pill, in configuration order.
@@ -119,25 +229,27 @@ impl Fleet {
         self.pills.is_empty()
     }
 
-    /// Record a reading heard from `addr`. Unlisted Pills are never stored, so they can't be posted.
-    pub fn on_heard(&mut self, addr: Addr, reading: Reading, now: Instant) -> Heard<'_> {
-        match self.pills.iter_mut().find(|p| p.addr == addr) {
-            Some(p) => {
-                p.latest = Some((reading, now));
-                let first = !p.seen;
-                p.seen = true;
-                Heard::Listed { name: &p.name, first }
-            }
-            None if self.reported_unlisted.contains(&addr) => Heard::UnlistedAgain,
-            None => {
-                self.reported_unlisted.push(addr);
-                Heard::UnlistedNew
-            }
+    /// Record a reading heard from `addr`. Unlisted Pills are remembered only for display, so they
+    /// can't be posted.
+    pub fn on_heard(&mut self, addr: Addr, rssi: i8, reading: Reading, now: Instant) -> Heard<'_> {
+        if let Some(i) = self.pills.iter().position(|p| p.addr == addr) {
+            let p = &mut self.pills[i];
+            p.latest = Some((reading, now));
+            p.last_heard = Some((reading, rssi, now));
+            let first = !p.seen;
+            p.seen = true;
+            return Heard::Listed { name: &p.name, first };
+        }
+        if self.remember_unlisted(addr, rssi, reading, now) {
+            Heard::UnlistedNew
+        } else {
+            Heard::UnlistedAgain
         }
     }
 
     /// Forget readings older than `MAX_READING_AGE`. Returns the names of the Pills affected.
     pub fn drop_stale(&mut self, now: Instant) -> Vec<String> {
+        self.unlisted.retain(|u| now.saturating_duration_since(u.3) <= MAX_READING_AGE);
         let mut dropped = Vec::new();
         for p in &mut self.pills {
             if let Some((_, heard_at)) = p.latest {
@@ -224,7 +336,7 @@ mod tests {
     fn first_reading_is_posted_immediately_under_its_own_name() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
         let due = fleet.due(t0);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].name, "Yellow Pill 1");
@@ -235,8 +347,8 @@ mod tests {
     fn each_pill_is_reported_under_its_own_name_with_its_own_reading() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
-        fleet.on_heard(B, reading(1.012), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
+        fleet.on_heard(B, -60, reading(1.012), t0);
         let due = fleet.due(t0);
         assert_eq!(due.len(), 2);
         let a = due.iter().find(|p| p.name == "Yellow Pill 1").unwrap();
@@ -249,8 +361,8 @@ mod tests {
     fn post_timers_are_independent_per_pill() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
-        fleet.on_heard(B, reading(1.012), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
+        fleet.on_heard(B, -60, reading(1.012), t0);
 
         // Only A posts successfully at t0.
         let due = fleet.due(t0);
@@ -259,15 +371,15 @@ mod tests {
 
         // Five minutes later both Pills report again. A is inside its 15 minutes, B never posted.
         let t5 = t0 + mins(5);
-        fleet.on_heard(A, reading(1.049), t5);
-        fleet.on_heard(B, reading(1.011), t5);
+        fleet.on_heard(A, -60, reading(1.049), t5);
+        fleet.on_heard(B, -60, reading(1.011), t5);
         let due = fleet.due(t5);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].name, "Red Pill 2");
 
         // At 15 minutes A is due again as well.
         let t15 = t0 + mins(15);
-        fleet.on_heard(A, reading(1.048), t15);
+        fleet.on_heard(A, -60, reading(1.048), t15);
         let names: Vec<_> = fleet.due(t15).into_iter().map(|p| p.name).collect();
         assert!(names.contains(&"Yellow Pill 1".to_string()));
     }
@@ -276,12 +388,12 @@ mod tests {
     fn interval_is_measured_from_the_last_successful_post() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
         fleet.mark_posted(0, t0);
 
-        fleet.on_heard(A, reading(1.049), t0 + mins(14));
+        fleet.on_heard(A, -60, reading(1.049), t0 + mins(14));
         assert!(fleet.due(t0 + mins(14)).is_empty());
-        fleet.on_heard(A, reading(1.048), t0 + mins(15));
+        fleet.on_heard(A, -60, reading(1.048), t0 + mins(15));
         assert_eq!(fleet.due(t0 + mins(15)).len(), 1);
     }
 
@@ -289,8 +401,8 @@ mod tests {
     fn a_failed_post_is_offered_again_and_does_not_block_other_pills() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
-        fleet.on_heard(B, reading(1.012), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
+        fleet.on_heard(B, -60, reading(1.012), t0);
 
         // A's post fails (never marked); B's succeeds.
         let due = fleet.due(t0);
@@ -308,19 +420,19 @@ mod tests {
     fn a_failed_post_is_not_retried_until_the_delay_has_passed() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
         assert_eq!(fleet.due(t0).len(), 1);
         fleet.mark_failed(0, t0);
 
         // Every one-second tick inside the delay is quiet...
         for secs in [0, 1, 2, 15, 29] {
             let t = t0 + Duration::from_secs(secs);
-            fleet.on_heard(A, reading(1.049), t); // a fresh reading must not bypass the backoff
+            fleet.on_heard(A, -60, reading(1.049), t); // a fresh reading must not bypass the backoff
             assert!(fleet.due(t).is_empty(), "offered again after only {secs}s");
         }
         // ...and it is offered again, with the newest reading, once the delay is over.
         let t30 = t0 + POST_RETRY_DELAY;
-        fleet.on_heard(A, reading(1.048), t30);
+        fleet.on_heard(A, -60, reading(1.048), t30);
         let due = fleet.due(t30);
         assert_eq!(due.len(), 1);
         assert_eq!(due[0].reading.gravity, 1.048);
@@ -330,14 +442,14 @@ mod tests {
     fn repeated_failures_keep_backing_off_without_giving_up() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
         let mut now = t0;
         for _ in 0..5 {
             assert_eq!(fleet.due(now).len(), 1);
             fleet.mark_failed(0, now);
             assert!(fleet.due(now + Duration::from_secs(1)).is_empty());
             now += POST_RETRY_DELAY;
-            fleet.on_heard(A, reading(1.050), now); // keep the reading fresh
+            fleet.on_heard(A, -60, reading(1.050), now); // keep the reading fresh
         }
     }
 
@@ -345,8 +457,8 @@ mod tests {
     fn one_pills_backoff_does_not_delay_another() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
-        fleet.on_heard(B, reading(1.012), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
+        fleet.on_heard(B, -60, reading(1.012), t0);
         fleet.mark_failed(0, t0); // A fails
         let due = fleet.due(t0 + Duration::from_secs(1));
         assert_eq!(due.len(), 1);
@@ -357,7 +469,7 @@ mod tests {
     fn backoff_does_not_keep_a_stale_reading_alive() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
         fleet.mark_failed(0, t0);
         let late = t0 + mins(21);
         assert_eq!(fleet.drop_stale(late), vec!["Yellow Pill 1".to_string()]);
@@ -368,14 +480,14 @@ mod tests {
     fn a_successful_post_after_failures_resets_the_normal_cycle() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
         fleet.mark_failed(0, t0);
         let t31 = t0 + Duration::from_secs(31);
         fleet.mark_posted(0, t31);
         // Next post is 15 minutes after the success, not affected by the earlier failure.
-        fleet.on_heard(A, reading(1.049), t31 + mins(14));
+        fleet.on_heard(A, -60, reading(1.049), t31 + mins(14));
         assert!(fleet.due(t31 + mins(14)).is_empty());
-        fleet.on_heard(A, reading(1.048), t31 + mins(15));
+        fleet.on_heard(A, -60, reading(1.048), t31 + mins(15));
         assert_eq!(fleet.due(t31 + mins(15)).len(), 1);
     }
 
@@ -383,7 +495,7 @@ mod tests {
     fn posted_reading_is_not_posted_twice() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
         fleet.mark_posted(0, t0);
         assert!(fleet.due(t0 + mins(30)).is_empty());
     }
@@ -392,7 +504,7 @@ mod tests {
     fn old_reading_is_not_reposted_when_the_interval_passes_without_a_new_one() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
         fleet.mark_posted(0, t0);
         // 15 minutes later the interval has elapsed and the old reading is not yet stale,
         // but it was already sent, so it must not be sent again.
@@ -404,8 +516,8 @@ mod tests {
     fn newest_reading_wins() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
-        fleet.on_heard(A, reading(1.044), t0 + Duration::from_secs(30));
+        fleet.on_heard(A, -60, reading(1.050), t0);
+        fleet.on_heard(A, -60, reading(1.044), t0 + Duration::from_secs(30));
         assert_eq!(fleet.due(t0 + Duration::from_secs(30))[0].reading.gravity, 1.044);
     }
 
@@ -413,7 +525,7 @@ mod tests {
     fn stale_readings_are_dropped_and_never_posted() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
 
         let late = t0 + mins(21);
         assert!(fleet.due(late).is_empty(), "stale reading must not be offered");
@@ -421,7 +533,7 @@ mod tests {
         assert!(fleet.drop_stale(late).is_empty(), "already dropped");
 
         // A fresh reading works again afterwards.
-        fleet.on_heard(A, reading(1.040), late);
+        fleet.on_heard(A, -60, reading(1.040), late);
         assert_eq!(fleet.due(late).len(), 1);
     }
 
@@ -429,7 +541,7 @@ mod tests {
     fn a_reading_just_inside_the_age_limit_is_still_posted() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        fleet.on_heard(A, reading(1.050), t0);
+        fleet.on_heard(A, -60, reading(1.050), t0);
         assert!(fleet.drop_stale(t0 + mins(20)).is_empty());
         assert_eq!(fleet.due(t0 + mins(20)).len(), 1);
     }
@@ -438,8 +550,8 @@ mod tests {
     fn unlisted_pills_are_reported_once_and_never_posted() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        assert_eq!(fleet.on_heard(STRANGER, reading(1.030), t0), Heard::UnlistedNew);
-        assert_eq!(fleet.on_heard(STRANGER, reading(1.031), t0), Heard::UnlistedAgain);
+        assert_eq!(fleet.on_heard(STRANGER, -60, reading(1.030), t0), Heard::UnlistedNew);
+        assert_eq!(fleet.on_heard(STRANGER, -60, reading(1.031), t0), Heard::UnlistedAgain);
         assert!(fleet.due(t0 + mins(60)).is_empty());
     }
 
@@ -447,7 +559,7 @@ mod tests {
     fn listed_pills_report_their_name_to_the_caller() {
         let mut fleet = two_pills();
         assert_eq!(
-            fleet.on_heard(B, reading(1.010), Instant::now()),
+            fleet.on_heard(B, -60, reading(1.010), Instant::now()),
             Heard::Listed { name: "Red Pill 2", first: true }
         );
     }
@@ -456,14 +568,14 @@ mod tests {
     fn only_the_first_sighting_of_each_pill_is_marked_first() {
         let t0 = Instant::now();
         let mut fleet = two_pills();
-        assert_eq!(fleet.on_heard(A, reading(1.050), t0), Heard::Listed { name: "Yellow Pill 1", first: true });
-        assert_eq!(fleet.on_heard(A, reading(1.049), t0), Heard::Listed { name: "Yellow Pill 1", first: false });
+        assert_eq!(fleet.on_heard(A, -60, reading(1.050), t0), Heard::Listed { name: "Yellow Pill 1", first: true });
+        assert_eq!(fleet.on_heard(A, -60, reading(1.049), t0), Heard::Listed { name: "Yellow Pill 1", first: false });
         // B has not been heard yet, so its first sighting is still "first".
-        assert_eq!(fleet.on_heard(B, reading(1.010), t0), Heard::Listed { name: "Red Pill 2", first: true });
-        assert_eq!(fleet.on_heard(B, reading(1.011), t0), Heard::Listed { name: "Red Pill 2", first: false });
+        assert_eq!(fleet.on_heard(B, -60, reading(1.010), t0), Heard::Listed { name: "Red Pill 2", first: true });
+        assert_eq!(fleet.on_heard(B, -60, reading(1.011), t0), Heard::Listed { name: "Red Pill 2", first: false });
         // Posting does not reset it.
         fleet.mark_posted(0, t0);
-        assert_eq!(fleet.on_heard(A, reading(1.048), t0), Heard::Listed { name: "Yellow Pill 1", first: false });
+        assert_eq!(fleet.on_heard(A, -60, reading(1.048), t0), Heard::Listed { name: "Yellow Pill 1", first: false });
     }
 
     #[test]
@@ -471,8 +583,8 @@ mod tests {
         let t0 = Instant::now();
         let mut fleet = Fleet::new(vec![]);
         assert!(fleet.is_empty());
-        assert_eq!(fleet.on_heard(A, reading(1.050), t0), Heard::UnlistedNew);
-        assert_eq!(fleet.on_heard(B, reading(1.010), t0), Heard::UnlistedNew);
+        assert_eq!(fleet.on_heard(A, -60, reading(1.050), t0), Heard::UnlistedNew);
+        assert_eq!(fleet.on_heard(B, -60, reading(1.010), t0), Heard::UnlistedNew);
         assert!(fleet.due(t0 + mins(60)).is_empty());
         assert_eq!(fleet.configured().count(), 0);
     }
@@ -537,7 +649,7 @@ mod tests {
         q.push(sighting(A, 1.050, -60));
         q.push(sighting(STRANGER, 1.030, -80));
         for s in q.take() {
-            fleet.on_heard(s.addr, s.reading, t0);
+            fleet.on_heard(s.addr, s.rssi, s.reading, t0);
         }
         let due = fleet.due(t0);
         assert_eq!(due.len(), 1);
@@ -549,5 +661,140 @@ mod tests {
         let fleet = two_pills();
         let got: Vec<_> = fleet.configured().map(|(a, n)| (*a, n.to_string())).collect();
         assert_eq!(got, vec![(A, "Yellow Pill 1".to_string()), (B, "Red Pill 2".to_string())]);
+    }
+    // ---- editing the configured list while running ----
+
+    #[test]
+    fn unlisted_pills_are_listed_for_the_settings_page_newest_first() {
+        let t0 = Instant::now();
+        let mut fleet = Fleet::new(vec![]);
+        fleet.on_heard(A, -70, reading(1.010), t0);
+        fleet.on_heard(B, -50, reading(1.020), t0 + mins(2));
+        let seen = fleet.unlisted(t0 + mins(3));
+        assert_eq!(seen.len(), 2);
+        assert_eq!(seen[0].addr, B);
+        assert_eq!(seen[0].rssi, -50);
+        assert_eq!(seen[0].age, mins(1));
+        assert_eq!(seen[1].addr, A);
+        assert_eq!(seen[1].age, mins(3));
+    }
+
+    #[test]
+    fn unlisted_pills_expire_with_stale_readings() {
+        let t0 = Instant::now();
+        let mut fleet = Fleet::new(vec![]);
+        fleet.on_heard(STRANGER, -60, reading(1.0), t0);
+        fleet.drop_stale(t0 + MAX_READING_AGE);
+        assert_eq!(fleet.unlisted(t0 + MAX_READING_AGE).len(), 1, "exactly at the limit is kept");
+        fleet.drop_stale(t0 + MAX_READING_AGE + Duration::from_secs(1));
+        assert!(fleet.unlisted(t0 + mins(21)).is_empty());
+    }
+
+    #[test]
+    fn unlisted_list_is_capped() {
+        let t0 = Instant::now();
+        let mut fleet = Fleet::new(vec![]);
+        for i in 0..40u8 {
+            fleet.on_heard([9, 9, 9, 9, 9, i], -60, reading(1.0), t0);
+        }
+        assert_eq!(fleet.unlisted(t0).len(), SightingQueue::MAX_PILLS);
+    }
+
+    #[test]
+    fn adding_an_unlisted_pill_posts_its_reading_immediately_without_waiting_for_a_new_advert() {
+        let t0 = Instant::now();
+        let mut fleet = Fleet::new(vec![]);
+        fleet.on_heard(A, -60, reading(1.044), t0);
+        assert!(fleet.due(t0).is_empty());
+
+        fleet.set_configured(vec![(A, "New Pill".into())]);
+        let due = fleet.due(t0 + mins(1));
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].name, "New Pill");
+        assert_eq!(due[0].reading.gravity, 1.044);
+        assert!(fleet.unlisted(t0 + mins(1)).is_empty(), "no longer shown as unlisted");
+    }
+
+    #[test]
+    fn keeping_a_pill_with_the_same_name_keeps_its_post_timer() {
+        let t0 = Instant::now();
+        let mut fleet = two_pills();
+        fleet.on_heard(A, -60, reading(1.050), t0);
+        let idx = fleet.due(t0)[0].idx;
+        fleet.mark_posted(idx, t0);
+
+        // The user adds a third Pill; A must not be re-posted early.
+        fleet.set_configured(vec![(A, "Yellow Pill 1".into()), (B, "Red Pill 2".into()), (STRANGER, "Third".into())]);
+        fleet.on_heard(A, -60, reading(1.049), t0 + mins(5));
+        assert!(fleet.due(t0 + mins(5)).is_empty());
+        assert_eq!(fleet.due(t0 + mins(15)).len(), 1);
+    }
+
+    #[test]
+    fn renaming_a_pill_keeps_its_reading_and_posts_at_once_as_a_new_device() {
+        let t0 = Instant::now();
+        let mut fleet = two_pills();
+        fleet.on_heard(A, -60, reading(1.050), t0);
+        let idx = fleet.due(t0)[0].idx;
+        fleet.mark_posted(idx, t0);
+        fleet.on_heard(A, -60, reading(1.048), t0 + mins(2));
+
+        fleet.set_configured(vec![(A, "Renamed".into()), (B, "Red Pill 2".into())]);
+        let due = fleet.due(t0 + mins(3));
+        assert_eq!(due.len(), 1, "inside the old 15 minutes, but this is a new Brewfather device");
+        assert_eq!(due[0].name, "Renamed");
+        assert_eq!(due[0].reading.gravity, 1.048);
+    }
+
+    #[test]
+    fn renaming_clears_a_failure_backoff() {
+        let t0 = Instant::now();
+        let mut fleet = two_pills();
+        fleet.on_heard(A, -60, reading(1.050), t0);
+        let idx = fleet.due(t0)[0].idx;
+        fleet.mark_failed(idx, t0);
+        assert!(fleet.due(t0 + Duration::from_secs(5)).is_empty());
+
+        fleet.set_configured(vec![(A, "Renamed".into()), (B, "Red Pill 2".into())]);
+        assert_eq!(fleet.due(t0 + Duration::from_secs(5)).len(), 1);
+    }
+
+    #[test]
+    fn removed_pill_is_forgotten_and_shown_as_unlisted_again() {
+        let t0 = Instant::now();
+        let mut fleet = two_pills();
+        fleet.on_heard(A, -60, reading(1.050), t0);
+        fleet.set_configured(vec![(B, "Red Pill 2".into())]);
+
+        assert!(fleet.due(t0).is_empty(), "a removed Pill is never posted");
+        let names: Vec<_> = fleet.configured().map(|(_, n)| n.to_string()).collect();
+        assert_eq!(names, ["Red Pill 2"]);
+        let unlisted = fleet.unlisted(t0);
+        assert_eq!(unlisted.len(), 1);
+        assert_eq!(unlisted[0].addr, A);
+    }
+
+    #[test]
+    fn set_configured_follows_the_new_order() {
+        let mut fleet = two_pills();
+        fleet.set_configured(vec![(B, "Red Pill 2".into()), (A, "Yellow Pill 1".into())]);
+        let order: Vec<_> = fleet.configured().map(|(a, _)| *a).collect();
+        assert_eq!(order, [B, A]);
+    }
+
+    #[test]
+    fn status_keeps_the_last_reading_after_it_has_been_posted() {
+        let t0 = Instant::now();
+        let mut fleet = two_pills();
+        fleet.on_heard(A, -64, reading(1.050), t0);
+        let idx = fleet.due(t0)[0].idx;
+        fleet.mark_posted(idx, t0);
+
+        let status = fleet.status(t0 + mins(4));
+        let a = status.iter().find(|s| s.addr == A).unwrap();
+        let (r, rssi, age) = a.last.unwrap();
+        assert_eq!((r.gravity, rssi, age), (1.050, -64, mins(4)));
+        let b = status.iter().find(|s| s.addr == B).unwrap();
+        assert!(b.last.is_none());
     }
 }
