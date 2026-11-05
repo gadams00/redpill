@@ -6,3 +6,11 @@ CONFIG_BT_BLE_ENABLED=y
 CONFIG_BT_BLUEDROID_ENABLED=n
 CONFIG_BT_NIMBLE_ENABLED=y
 CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
+
+# Settings web page / setup portal: phones send long request headers (cookies, user agents).
+CONFIG_HTTPD_MAX_REQ_HDR_LEN=1024
+CONFIG_HTTPD_MAX_URI_LEN=512
+
+# The settings page / portal server keeps up to 8 client sockets open (browsers open several
+# parallel connections); the server needs 3 more for itself. Default is 10.
+CONFIG_LWIP_MAX_SOCKETS=16
