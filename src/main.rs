@@ -29,7 +29,7 @@ use pages::Join;
 use serde::Serialize;
 use settings::Settings;
 use std::net::Ipv4Addr;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant};
 use store::Store;
@@ -55,8 +55,9 @@ pub struct Config {
 }
 
 /// Length of one BLE scan. The scan thread restarts it immediately when it ends, so this only
-/// sets how often (a few milliseconds of) restart gap occurs.
-const SCAN_MS: i32 = 10 * 60 * 1000;
+/// sets how often (a few milliseconds of) restart gap occurs, and how long it takes to pause
+/// scanning (see `Shared::scan_paused`).
+const SCAN_MS: i32 = 30 * 1000;
 /// Stack for the scan thread. The scan callback itself runs on NimBLE's own task, not this one.
 const SCAN_THREAD_STACK: usize = 8192;
 /// How long to wait for the scan thread to bring up the Bluetooth stack.
@@ -65,9 +66,10 @@ const BLE_INIT_WAIT: Duration = Duration::from_secs(10);
 const LOOP_TICK: Duration = Duration::from_secs(1);
 /// Minimum time between Wi-Fi (re)connect attempts.
 const WIFI_RETRY: Duration = Duration::from_secs(10);
-/// Reconnect interval while the setup portal is open: scanning and connecting hop channels, which
-/// would otherwise keep dropping a phone that is using the portal.
-const WIFI_RETRY_WITH_PORTAL: Duration = Duration::from_secs(60);
+/// Reconnect interval while the setup portal is open. Every attempt makes the setup network follow
+/// the router's channel for several seconds (it hops between channels when the router has several
+/// nodes), which drops a phone that is using the portal, so attempts are rare.
+const WIFI_RETRY_WITH_PORTAL: Duration = Duration::from_secs(5 * 60);
 /// Log a "still scanning" line this often, so an unattended board shows it is alive and what it hears.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5 * 60);
 /// After this many posts fail in a row, assume the Wi-Fi/DNS state is stuck and reconnect.
@@ -105,6 +107,10 @@ struct Shared {
     pill_readings: AtomicU32,
     /// Packets with the RAPT company id that were not usable (other packet types, junk gravity).
     pill_other: AtomicU32,
+    /// While the fallback setup network is open, Bluetooth scanning is paused: it runs at nearly
+    /// 100% duty and starves the access point's Wi-Fi beacons on the ESP32's single radio, so phones
+    /// could not see the setup network. Nothing can be posted without Wi-Fi anyway.
+    scan_paused: AtomicBool,
 }
 
 /// A running fallback setup portal, opened on top of normal operation.
@@ -509,6 +515,7 @@ fn run_normal(
             ever_connected = true;
             lock(&lan.view).ip = ip.to_string();
             if portal.take().is_some() {
+                shared.scan_paused.store(false, Ordering::Release);
                 info!("Wi-Fi connected; closing the setup network");
                 if let Err(e) = wifi.set_configuration(&WifiConfiguration::Client(client.clone())) {
                     warn!("could not leave setup-network mode: {e:?}");
@@ -539,7 +546,10 @@ fn run_normal(
         {
             last_portal_try = Some(now);
             match open_fallback_portal(&mut wifi, &client, &mac, stored_name.as_deref()) {
-                Ok(p) => portal = Some(p),
+                Ok(p) => {
+                    shared.scan_paused.store(true, Ordering::Release);
+                    portal = Some(p);
+                }
                 Err(e) => error!("could not open the setup portal: {e}"),
             }
         }
@@ -680,7 +690,7 @@ fn open_fallback_portal(
     let networks = scan_networks(wifi);
     warn!(
         "Wi-Fi has not connected since boot. Opening the setup network {ssid:?} (password {:?}); \
-         scanning continues meanwhile",
+         Bluetooth scanning is paused until Wi-Fi connects",
         setup_password()
     );
     let shared = Arc::new(PortalShared::new(
@@ -802,6 +812,10 @@ fn scan_forever(shared: Arc<Shared>, ready: mpsc::Sender<()>) {
     let _ = ready.send(());
 
     loop {
+        // Paused while the fallback setup network is open (see `Shared::scan_paused`).
+        while shared.scan_paused.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(500));
+        }
         let result = block_on(async {
             let mut scan = BLEScan::new();
             // Passive scan: all the data we need is in the advertisement itself.

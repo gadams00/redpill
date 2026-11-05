@@ -202,7 +202,9 @@ board already has Wi-Fi saved, setup mode closes by itself after 10 minutes and 
 with the old network.
 
 If the board **cannot join Wi-Fi at all** within 5 minutes of power-up (wrong password, new
-router), it opens the setup network automatically while it keeps trying the saved one. A router
+router), it opens the setup network automatically (named after the board, e.g. `redpill-setup-a1b2`) and keeps
+trying the saved Wi-Fi once every 5 minutes. Bluetooth scanning is paused while that network is open,
+since nothing can be posted without Wi-Fi and scanning would drown out the setup network's signal. A router
 outage while the board is already running does not do this.
 
 ## 6. Watch it work
@@ -288,9 +290,10 @@ default.
   from a phone, picking a network and joining it (the board saved its Wi-Fi and name and restarted),
   the settings page from a PC and from a phone (after allowing Android's local-network permission),
   the `redpill.local` name from Windows, adding / renaming / removing Pills, renaming the board,
-  and persistence across reboots. **Not yet tried:** the automatic setup network after 5 minutes
-  without Wi-Fi, the BOOT-button restart, two boards on one network, and a live Pill reading
-  through the new settings page.
+  persistence across reboots, a live Pill reading appearing on the page and posting to Brewfather,
+  the BOOT-button restart into setup mode, and the **automatic setup network** after 5 minutes
+  without Wi-Fi (with a wrong saved password, a phone joined it, entered the right password, and the
+  board recovered and kept its Pill and stream ID). **Not tried:** two boards on one network.
 - Not verified: **more than one Pill**, v1-format Pills, and **recovery when the Wi-Fi connection
   itself drops while running** (the router tests only blocked internet access).
 
